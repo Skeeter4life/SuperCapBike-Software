@@ -2,7 +2,7 @@
  * ATMEGA328_SuperCapBike_Firmware.c
  *
  * Created: 2024-09-20 11:38:06 AM
- * Author : Andrew Fischer
+ * Author : Andrew
  */ 
 
 #include <avr/io.h>
@@ -11,16 +11,18 @@
 #include <stdbool.h>
 
 #define F_CPU 16000000
+#define SHIFT_AMOUNT 8
+#define SHIFT_MASK ((1 << SHIFT_AMOUNT) - 1)
 
 // VOLATILE DEFN'S: Compiler assumes variables do not changed unless they are explicitly modified within the program; this is not the case here; Must always read from memory
 volatile uint16_t ADC_DATA_0; // Throttle Data
 volatile uint16_t ADC_DATA_1; // C1 Voltage
 volatile uint16_t ADC_DATA_2; // VCC Voltage
-
 volatile uint8_t ADC_Selection = 0; // 0 = ADC 0 1 = ADC 1 2 = ADC 2
 
+// Note: I prefer returning '0' when a process has failed, and '1' when it succeeds.
+
 struct Diagnostics{
-	bool is_Seires; // True if capacitors are in series False if in parallel
 	
 	uint8_t VC1; // Voltage of Capacitor 1
 	uint8_t mVC1; // mV of Capacitor 1
@@ -28,58 +30,108 @@ struct Diagnostics{
 	uint8_t VC2;  // Voltage of Capacitor 2
 	uint8_t mVC2; // mV of Capacitor 2
 
-	uint8_t VCC; // VCC Volts
-	uint8_t mVCC; // VCC miliVolts
-
 	uint8_t Throttle_Position; // Range of {0 1, 2 ... 100} (% Applied)
 
+	uint8_t Fault_Code;
+	
 	bool is_ShutDown;
-	char Fault_Code[16];
+	bool is_Series; // True if capacitors are in series False if in parallel
+	///char Fault_Code[16];
 }Bike_Status;
 
 
-void Compute_Voltages(){
-	uint8_t mV;
-	uint8_t V;
+void Compute_Voltages(){ // Uses fixed point arithmetic
 
-	//Compute C1 First:
+	uint32_t VC1_Equation = (((ADC_DATA_1 << SHIFT_AMOUNT)<<4)/1023);
+	uint32_t VCC_Equation;
 
-	mV = ((ADC_DATA_1 * 5)/1024) * 1000 * (80/25); // ADC = (VIN*1024)/VREF (80/25 Voltage divider)
-	V = (mV/1000);
+	uint32_t VC1;
+	uint32_t mVC1; // I use these for a couple calculations. It intuitively seems faster to make a local copy for this subroutine, rather then going to Bike_Status each time.
+	
 
-	mV -= V * 1000;
+	VC1 = VC1_Equation >> SHIFT_AMOUNT;
+	mVC1 = (((VC1_Equation & SHIFT_MASK) * 100)/(1 << SHIFT_AMOUNT));
 
-	Bike_Status.mVC1 = mV;
-	Bike_Status.VC1 = V;
 
-	// Compute VCC:
-	if(Bike_Status.is_Seires){
-		mV = ((ADC_DATA_2 * 5)/1024) * 1000 * (23704/3704);
-		V = (mV/1000);
+	if(Bike_Status.is_Series){
+		VCC_Equation = (((ADC_DATA_2 << SHIFT_AMOUNT) * 391)/12500);
 
-		mV -= V * 1000;
-
-		if(Bike_Status.mVC1 > mV){
-			Bike_Status.mVC2 = 1000 - (Bike_Status.mVC1 - mV);
-			}else{
-			Bike_Status.mVC2 = mV - Bike_Status.mVC1;
-		}
-		Bike_Status.mVC2 = V - Bike_Status.VC1;
-
+		Bike_Status.VC2 = (VCC_Equation >> SHIFT_AMOUNT) - VC1;
+		Bike_Status.mVC2 = (((VCC_Equation & SHIFT_MASK) * 100)/(1 << SHIFT_AMOUNT)) - mVC1;
+		
 		}else{
-		mV = (ADC_DATA_2 * 1024/5) * 1000 * (9091/29091);
-		V = (mV/1000);
+		VCC_Equation = (((ADC_DATA_2 << SHIFT_AMOUNT)<<4)/1023);
 
-		mV -= V * 1000;
+		Bike_Status.VC2 = (VCC_Equation >> SHIFT_AMOUNT);
+		Bike_Status.VC2 = (((VCC_Equation & SHIFT_MASK) * 100)/(1 << SHIFT_AMOUNT));
+		
 	}
 
-	Bike_Status.mVCC = mV;
-	Bike_Status.VCC = V;
-
+	Bike_Status.VC1 = VC1;
+	Bike_Status.mVC1 = mVC1;
+	
+	
 }
 
 void Compute_Throttle(){
+}
 
+int8_t Transmit_Data(uint8_t DATA){
+	TWCR = (1 << TWINT) &~(1<<TWSTA) &~(1<<TWSTO) | (1<<TWEN); // Reset the interrupt flag, clear start bit, ensure stop bit is cleared, ensure TWI is enabled in the control register
+	TWDR = DATA;
+	while(TWSR &= ~(1<<TWINT));  // Wait for the interrupt flag to be reset
+	if(TWSR == 0x30){
+		// Error, NOT ACK
+		return 0;
+	}
+
+	return 1;
+
+}
+
+void TWI_Stop(){
+	TWCR = (1 << TWINT) &~ (1 << TWSTA) | (1 << TWSTO) | (1<<TWEN); // Clear interrupt flag, set start bit, ensure stop register is cleared, and enable TWI to the control register
+}
+
+
+int8_t Slave_Write(uint8_t SLA_W){
+	TWCR = (1 << TWINT) &~(1<<TWSTA) &~(1<<TWSTO) | (1<<TWEN); // Reset the interrupt flag, clear start bit, ensure stop bit is cleared, ensure TWI is enabled in the control register
+	TWDR = (SLA_W << 1); // Write to the data register the adress of the MCP23017
+	while(TWSR &= ~(1<<TWINT));  // Wait for the interrupt flag to be reset
+	if(TWSR == 0x20){
+		//Error, slave did not acklowadge adress was received! Attempt 3 more times.
+		return 0;
+	}
+
+	return 1;
+}
+
+int8_t TWI_Start(){
+	TWCR = (1 << TWINT) | (1 << TWSTA) &~(1 << TWSTO) | (1<<TWEN); // Clear interrupt flag, set start bit, ensure stop register is cleared, and enable TWI to the control register
+	while(TWCR &= ~(1<<TWINT)); // Wait for the interrupt flag to be reset
+	if(TWSR != 0xF8){
+		// Error, start bit not successfully sent!
+		return 0;
+	}
+
+	return 1;
+}
+
+void MCP_GPIO_Handler(uint8_t Register_Adress, uint8_t Data){
+	uint8_t MCP23017_Adress = 0x20;
+
+	uint8_t Start = TWI_Start(); // I sacrified a few bytes here for readability.
+	uint8_t Write;
+	uint8_t Received;
+
+	if(Start){
+		Write = Slave_Write(MCP23017_Adress);
+	}
+	if(Write){
+		Received = Transmit_Data(Register_Adress);
+		Received = Transmit_Data(Data);
+	}
+	TWI_Stop();
 }
 
 ISR(ADC_vect){
@@ -126,9 +178,15 @@ void init_ADC(){
 
 int main(void){
 	// ** Read state of series parallel switch!!
+	// SREG |= (1 << SREG_I);  // Sets the global interrupt enable bit in SREG
+
+	MCP_GPIO_Handler(0x12, 0b01111111); // Adress GPIOA, configure all pins except IO 7 as input
 	
-	sei(); // Enable interrupts
 	init_ADC();
+
+	sei(); // Enable global interrupts
+	// cli(); for error handling
+
 	ADCSRA |= (1 << ADSC); // Start the ADC
 
 	DDRB |= (1 << DDB0); // Set B0 as an output pin
@@ -139,4 +197,5 @@ int main(void){
 	}
 
 }
+
 
